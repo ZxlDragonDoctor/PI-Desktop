@@ -412,6 +412,17 @@ const COMPACTION_FALLBACK_MAX_SUMMARY_CHARS = 12_000;
 const COMPACTION_SUMMARY_PROMPT_SAFETY_TOKENS = 2_048;
 const COMPACTION_FALLBACK_MARKER =
   "[automatic context recovery: older context was omitted after summary generation failed]";
+
+/**
+ * Transient summary failures retry the same compaction request this many times
+ * before retained-tail recovery (#543). Budget-exceeded attempts use a reduced
+ * payload and still count against the same cap.
+ */
+const COMPACTION_SUMMARY_MAX_ATTEMPTS = 3;
+/** Backoff between summary retries; capped so a long turn is not pinned. */
+const COMPACTION_SUMMARY_RETRY_BASE_MS = 2_000;
+const COMPACTION_SUMMARY_RETRY_MAX_MS = 8_000;
+
 /** Path-scoped rules are best-effort and must not stall a file tool turn. */
 export const PATH_INSTRUCTION_RESOLUTION_TIMEOUT_MS = 2_000;
 const PATH_SCOPED_INSTRUCTION_TOOLS = new Set([
@@ -4621,7 +4632,7 @@ Delegation rules:
     const summary = [
       previousSummary,
       COMPACTION_FALLBACK_MARKER,
-      "The automatic summary request did not complete. Older messages before this checkpoint are omitted from the next model request.",
+      "Summary generation failed after retries. Older messages before this checkpoint are omitted from the next model request.",
       `The complete transcript remains available in the session. ${continuation}`,
     ].join("\n\n");
     return this.createCheckpoint(
@@ -4636,6 +4647,28 @@ Delegation rules:
         retainedTailMode: retentionMode,
       },
     );
+  }
+
+  /**
+   * Drop oldest summarize-eligible messages until the summary input fits the
+   * provider budget (#543). Returns undefined when even a minimal payload
+   * cannot fit — the caller then falls back to retained-tail recovery.
+   */
+  private shrinkPreparationForSummary(
+    preparation: ShapedPreparation,
+    budget: { hardLimit: number; requestHeadroom: number },
+  ): ShapedPreparation | undefined {
+    const messages = [...preparation.messagesToSummarize];
+    if (messages.length <= 1) return undefined;
+    // Keep at least one message so compact() still has something to summarize.
+    while (messages.length > 1) {
+      messages.shift();
+      const candidate: ShapedPreparation = { ...preparation, messagesToSummarize: messages };
+      if (!this.compactionSummaryWouldExceedBudget(candidate, budget)) {
+        return candidate;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -4890,15 +4923,22 @@ Delegation rules:
     }
 
     if (this.compactionSummaryWouldExceedBudget(preparation.value, budget)) {
-      return {
-        ok: false,
-        entries,
-        budget,
-        preparation: preparation.value,
-        tokensBefore: preparation.value.tokensBefore,
-        message: "Compaction summary input exceeds the safe model budget",
-        recoverable: true,
-      };
+      // Do not skip the model on the first oversized attempt (#543). Shrink
+      // the summary input by dropping oldest messages until the budget guard
+      // clears, then summarize that reduced payload.
+      const reduced = this.shrinkPreparationForSummary(preparation.value, budget);
+      if (!reduced) {
+        return {
+          ok: false,
+          entries,
+          budget,
+          preparation: preparation.value,
+          tokensBefore: preparation.value.tokensBefore,
+          message: "Compaction summary input exceeds the safe model budget",
+          recoverable: true,
+        };
+      }
+      preparation = { ok: true, value: reduced };
     }
 
     let result: Awaited<ReturnType<typeof compact>>;
@@ -5045,28 +5085,53 @@ Delegation rules:
   ): Promise<boolean> {
     this.emit({ type: "compaction_start", reason });
     this.compactionAbort = new AbortController();
-    let build: CheckpointBuild;
+    let build: CheckpointBuild | undefined;
+    let lastMessage = "";
     try {
-      build = await this.buildCheckpoint(this.compactionAbort.signal, retentionMode);
+      // Retry transient summary failures before retained-tail recovery (#543).
+      // Budget-exceeded paths also retry: the next attempt uses a reduced
+      // payload instead of skipping the model outright.
+      for (let attempt = 1; attempt <= COMPACTION_SUMMARY_MAX_ATTEMPTS; attempt++) {
+        if (this.compactionAbort.signal.aborted) break;
+        build = await this.buildCheckpoint(this.compactionAbort.signal, retentionMode);
+        if (build.ok) break;
+        lastMessage = build.message;
+        if (!build.recoverable) break;
+        if (attempt === COMPACTION_SUMMARY_MAX_ATTEMPTS) break;
+        const delayMs = Math.min(
+          COMPACTION_SUMMARY_RETRY_MAX_MS,
+          COMPACTION_SUMMARY_RETRY_BASE_MS * 2 ** (attempt - 1),
+        );
+        try {
+          await delayWithAbort(delayMs, this.compactionAbort.signal);
+        } catch {
+          break;
+        }
+      }
     } finally {
       this.compactionAbort = undefined;
     }
-    if (!build.ok) {
-      if (!build.recoverable) {
-        this.emitCompactionFailure(reason, build.tokensBefore, build.message);
+    const finalBuild = build;
+    if (!finalBuild || !finalBuild.ok) {
+      if (!finalBuild || !finalBuild.recoverable) {
+        this.emitCompactionFailure(
+          reason,
+          finalBuild?.tokensBefore,
+          finalBuild?.message ?? lastMessage,
+        );
         return false;
       }
       return await this.recoverCompactionFailure(
-        build.entries,
-        build.budget,
+        finalBuild.entries,
+        finalBuild.budget,
         reason,
         willRetry,
-        build.preparation,
-        build.message,
+        finalBuild.preparation,
+        lastMessage || finalBuild.message,
         retentionMode,
       );
     }
-    return await this.installCheckpoint(build, reason, willRetry, retentionMode);
+    return await this.installCheckpoint(finalBuild, reason, willRetry, retentionMode);
   }
 
   async compactManually(): Promise<void> {
